@@ -84,11 +84,11 @@ class NeuSRenderer:
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
         self.color_network = color_network
-        self.n_samples = n_samples
-        self.n_importance = n_importance
-        self.n_outside = n_outside
-        self.up_sample_steps = up_sample_steps
-        self.perturb = perturb
+        self.n_samples = n_samples #64
+        self.n_importance = n_importance #64
+        self.n_outside = n_outside #32
+        self.up_sample_steps = up_sample_steps #4  1 for simple coarse-to-fine sampling
+        self.perturb = perturb #1
 
     def render_core_outside(self, rays_o, rays_d, z_vals, sample_dist, nerf, background_rgb=None):
         """
@@ -99,6 +99,7 @@ class NeuSRenderer:
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)
+        # sample_dist = 2 / 32,a float number
         mid_z_vals = z_vals + dists * 0.5
 
         # Section midpoints
@@ -106,12 +107,12 @@ class NeuSRenderer:
 
         dis_to_center = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).clip(1.0, 1e10)
         pts = torch.cat([pts / dis_to_center, 1.0 / dis_to_center], dim=-1)       # batch_size, n_samples, 4
-
+        # normalize pts, and add a fourth element : 1/distance-to-center
         dirs = rays_d[:, None, :].expand(batch_size, n_samples, 3)
 
         pts = pts.reshape(-1, 3 + int(self.n_outside > 0))
         dirs = dirs.reshape(-1, 3)
-
+        # classical way to compute the color of each point and the rendered pixel
         density, sampled_color = nerf(pts, dirs)
         sampled_color = torch.sigmoid(sampled_color)
         alpha = 1.0 - torch.exp(-F.softplus(density.reshape(batch_size, n_samples)) * dists)
@@ -133,6 +134,7 @@ class NeuSRenderer:
         """
         Up sampling give a fixed inv_s
         """
+        # z_vals is also normalized
         batch_size, n_samples = z_vals.shape
         pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]  # n_rays, n_samples, 3
         radius = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=False)
@@ -203,7 +205,8 @@ class NeuSRenderer:
                     background_sampled_color=None,
                     background_rgb=None,
                     cos_anneal_ratio=0.0):
-        batch_size, n_samples = z_vals.shape
+        # render the object
+        batch_size, n_samples = z_vals.shape # batch_size = n_rays
 
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -212,20 +215,21 @@ class NeuSRenderer:
 
         # Section midpoints
         pts = rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]  # n_rays, n_samples, 3
-        dirs = rays_d[:, None, :].expand(pts.shape)
+        dirs = rays_d[:, None, :].expand(pts.shape) # n_rays, n_samples, 3
 
-        pts = pts.reshape(-1, 3)
-        dirs = dirs.reshape(-1, 3)
+        pts = pts.reshape(-1, 3) # n_rays * n_samples, 3
+        dirs = dirs.reshape(-1, 3) # n_rays * n_samples, 3
 
-        sdf_nn_output = sdf_network(pts)
+        sdf_nn_output = sdf_network(pts) # output [sdf_vals,feature_vectors]
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
 
-        gradients = sdf_network.gradient(pts).squeeze()
+        gradients = sdf_network.gradient(pts).squeeze() #this is the normal of the surface, why?
         sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
 
-        inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
+        inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)  # Single parameter,only use the shape of input
         inv_s = inv_s.expand(batch_size * n_samples, 1)
+        # return torch.ones([len(x), 1]) * torch.exp(self.variance * 10.0)
 
         true_cos = (dirs * gradients).sum(-1, keepdim=True)
 
@@ -238,16 +242,16 @@ class NeuSRenderer:
         estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
         estimated_prev_sdf = sdf - iter_cos * dists.reshape(-1, 1) * 0.5
 
-        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s) # read the papaer, the sigmoid here has a scalar s, which is trainable
         next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
 
-        p = prev_cdf - next_cdf
-        c = prev_cdf
+        p = prev_cdf - next_cdf # - derivative of the cdf
+        c = prev_cdf # cdf
 
-        alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
+        alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0) # opaque function, paper eq (13)
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
-        inside_sphere = (pts_norm < 1.0).float().detach()
+        inside_sphere = (pts_norm < 1.0).float().detach() # everythigng is in world space, and the IOR is a unit sphere
         relax_inside_sphere = (pts_norm < 1.2).float().detach()
 
         # Render with background
@@ -285,12 +289,12 @@ class NeuSRenderer:
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
         batch_size = len(rays_o)
-        sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples)
+        sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere -> 2*radius(1) / 64
+        z_vals = torch.linspace(0.0, 1.0, self.n_samples) # [0, 1] but 64 samples
         z_vals = near + (far - near) * z_vals[None, :]
 
         z_vals_outside = None
-        if self.n_outside > 0:
+        if self.n_outside > 0: # for background
             z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
 
         n_samples = self.n_samples
@@ -299,19 +303,21 @@ class NeuSRenderer:
         if perturb_overwrite >= 0:
             perturb = perturb_overwrite
         if perturb > 0:
-            t_rand = (torch.rand([batch_size, 1]) - 0.5)
-            z_vals = z_vals + t_rand * 2.0 / self.n_samples
+            t_rand = (torch.rand([batch_size, 1]) - 0.5) #[-0.5, 0.5]  randomly perturb the point
+            z_vals = z_vals + t_rand * 2.0 / self.n_samples # 2/n_samples is the distance between two samples in a unit sphere
 
             if self.n_outside > 0:
+                # classic way to perturb the point
                 mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
                 upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
                 lower = torch.cat([z_vals_outside[..., :1], mids], -1)
                 t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
                 z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
+                # (batch_size,n_samples)
 
         if self.n_outside > 0:
             z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
-
+            # torch.flip -> reverse the order of the elements in the tensor
         background_alpha = None
         background_sampled_color = None
 
@@ -339,8 +345,8 @@ class NeuSRenderer:
 
         # Background model
         if self.n_outside > 0:
-            z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
-            z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
+            z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)  # n_samples + n_outside
+            z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1) # small -> large, return values and indices
             ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
 
             background_sampled_color = ret_outside['sampled_color']
@@ -349,7 +355,7 @@ class NeuSRenderer:
         # Render core
         ret_fine = self.render_core(rays_o,
                                     rays_d,
-                                    z_vals,
+                                    z_vals, # n_samples
                                     sample_dist,
                                     self.sdf_network,
                                     self.deviation_network,

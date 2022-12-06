@@ -7,6 +7,7 @@ from models.embedder import get_embedder
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
+    # it's just a typical nerf-like model
     def __init__(self,
                  d_in,
                  d_out,
@@ -22,17 +23,18 @@ class SDFNetwork(nn.Module):
         super(SDFNetwork, self).__init__()
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
-
+        #(3,256,3)
         self.embed_fn_fine = None
 
         if multires > 0:
+        # multires is simply for the encoding of the input
             embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
             self.embed_fn_fine = embed_fn
             dims[0] = input_ch
 
         self.num_layers = len(dims)
         self.skip_in = skip_in
-        self.scale = scale
+        self.scale = scale # 3.0
 
         for l in range(0, self.num_layers - 1):
             if l + 1 in self.skip_in:
@@ -42,15 +44,15 @@ class SDFNetwork(nn.Module):
 
             lin = nn.Linear(dims[l], out_dim)
 
-            if geometric_init:
-                if l == self.num_layers - 2:
-                    if not inside_outside:
+            if geometric_init: # applied
+                if l == self.num_layers - 2: #last layer
+                    if not inside_outside: # applied
                         torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
                         torch.nn.init.constant_(lin.bias, -bias)
                     else:
                         torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
                         torch.nn.init.constant_(lin.bias, bias)
-                elif multires > 0 and l == 0:
+                elif multires > 0 and l == 0: #first layer
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
                     torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
@@ -62,15 +64,15 @@ class SDFNetwork(nn.Module):
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
 
-            if weight_norm:
+            if weight_norm: #applied
                 lin = nn.utils.weight_norm(lin)
 
             setattr(self, "lin" + str(l), lin)
 
-        self.activation = nn.Softplus(beta=100)
+        self.activation = nn.Softplus(beta=100) #relu, but more smooth
 
     def forward(self, inputs):
-        inputs = inputs * self.scale
+        inputs = inputs * self.scale #3.0
         if self.embed_fn_fine is not None:
             inputs = self.embed_fn_fine(inputs)
 
@@ -94,6 +96,7 @@ class SDFNetwork(nn.Module):
         return self.forward(x)
 
     def gradient(self, x):
+        # calcualte gradients for calculating the opaque density (normals)
         x.requires_grad_(True)
         y = self.sdf(x)
         d_output = torch.ones_like(y, requires_grad=False, device=y.device)
@@ -109,6 +112,7 @@ class SDFNetwork(nn.Module):
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class RenderingNetwork(nn.Module):
+    # color-network12
     def __init__(self,
                  d_feature,
                  mode,
@@ -124,13 +128,13 @@ class RenderingNetwork(nn.Module):
         self.mode = mode
         self.squeeze_out = squeeze_out
         dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
-
+        #d_in = 9(points, view_dir,normal), d_feature=256, d_idden = 256, d_out = 3
         self.embedview_fn = None
         if multires_view > 0:
             embedview_fn, input_ch = get_embedder(multires_view)
             self.embedview_fn = embedview_fn
             dims[0] += (input_ch - 3)
-
+            # positional encoding only for view-direction
         self.num_layers = len(dims)
 
         for l in range(0, self.num_layers - 1):
